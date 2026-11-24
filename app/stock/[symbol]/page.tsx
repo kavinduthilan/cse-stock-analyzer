@@ -4,11 +4,11 @@ import { Change } from "@/components/Change";
 import Reports from "@/components/Report";
 import FinancialTrends from "@/components/FinancialTrends";
 import AnalystChat from "@/components/AnalystChat";
+import RefreshData from "@/components/RefreshData";
 import { annualRatios, quarterly } from "@/lib/analytics";
 
 export const revalidate = 30;
 
-// DB may not exist yet (ETL not run) -> return empty instead of crashing the page
 function loadAnalytics(symbol: string) {
   try {
     return {
@@ -23,6 +23,7 @@ function loadAnalytics(symbol: string) {
 export default async function StockPage({ params }: { params: Promise<{ symbol: string }> }) {
   const { symbol: raw } = await params;
   const symbol = decodeURIComponent(raw);
+  const canRefresh = process.env.NODE_ENV !== "production" || process.env.ALLOW_ETL === "1";
 
   const [data, reports] = await Promise.all([
     cse("companyInfoSummery", { symbol }),
@@ -74,13 +75,12 @@ export default async function StockPage({ params }: { params: Promise<{ symbol: 
         {facts.map(([k, v]) => (<div key={k} className="bg-white p-3"><dt className="text-xs text-muted">{k}</dt><dd className="font-medium">{v}</dd></div>))}
       </dl>
 
-      {/* fundamentals from your own DB */}
+      {/* fundamentals from your own DB, with a button to rebuild them */}
+      {canRefresh && <RefreshData symbol={symbol} />}
       <FinancialTrends annual={annual} quarterlyProfit={quarterlyProfit} />
 
-      {/* AI agent */}
       <AnalystChat symbol={symbol} />
 
-      {/* raw PDFs from CSE */}
       <Reports data={reports} />
     </div>
   );

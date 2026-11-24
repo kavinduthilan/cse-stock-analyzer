@@ -7,7 +7,7 @@ export default function AnalystChat({ symbol }: { symbol: string }) {
 
   async function ask() {
     setBusy(true); setA("");
-    const r = await fetch("/api/analyze", { method: "POST", body: JSON.stringify({ symbol, question: q }) });
+    const r = await fetch("/api/cse/analyze", { method: "POST", body: JSON.stringify({ symbol, question: q }) });
     setA((await r.json()).answer); setBusy(false);
   }
   return (

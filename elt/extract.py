@@ -1,7 +1,12 @@
 import json, re, sqlite3, pathlib, datetime as dt
 import pdfplumber
 
-SYMBOL = "COCR.N0000"
+import sys
+if len(sys.argv) < 2:
+    sys.exit("usage: python extract.py SYMBOL   e.g. COCR.N0000")
+SYMBOL = sys.argv[1]
+
+
 BASIS = "company"            # "company" or "group": which set of columns you want
 HERE = pathlib.Path(__file__).resolve().parent
 ROOT = HERE.parent / "data"
