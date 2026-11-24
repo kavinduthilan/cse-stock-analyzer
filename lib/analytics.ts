@@ -66,3 +66,129 @@ export function annualRatios(symbol: string) {
     };
   });
 }
+
+
+export const STATEMENTS = {
+  position: [
+    ["total_assets", "Total assets"],
+    ["loans", "Loans and receivables"],
+    ["total_liabilities", "Total liabilities"],
+    ["deposits", "Deposits"],
+    ["borrowings", "Borrowings"],
+    ["total_equity", "Total equity"],
+  ],
+  profit: [
+    ["interest_income", "Interest income"],
+    ["interest_expense", "Interest expense"],
+    ["net_interest_income", "Net interest income"],
+    ["total_operating_income", "Total operating income"],
+    ["operating_expenses", "Operating expenses"],
+    ["impairment", "Impairment charges"],
+    ["profit_before_tax", "Profit before tax"],
+    ["profit_after_tax", "Profit after tax"],
+  ],
+  cashflow: [
+    ["cfo", "Operating activities"],
+    ["cfi", "Investing activities"],
+    ["cff", "Financing activities"],
+  ],
+} as const;
+
+export type StatementKey = keyof typeof STATEMENTS;
+
+export type StatementTable = {
+  years: string[];
+  rows: { key: string; label: string; values: (number | null)[] }[];
+};
+
+// Annual values (full rupees) for one statement, last `maxYears` years
+export function statementTable(symbol: string, statement: StatementKey, maxYears = 10): StatementTable {
+  const defs = STATEMENTS[statement];
+  const maps = defs.map(([key]) =>
+    new Map(series(symbol, key).filter((r) => r.period_months === 12).map((r) => [r.period_end, r.value]))
+  );
+  const years = Array.from(new Set(maps.flatMap((m) => [...m.keys()]))).sort().slice(-maxYears);
+  return {
+    years,
+    rows: defs.map(([key, label], i) => ({
+      key, label, values: years.map((y) => maps[i].get(y) ?? null),
+    })),
+  };
+}
+
+export function allStatements(symbol: string) {
+  return {
+    position: statementTable(symbol, "position"),
+    profit: statementTable(symbol, "profit"),
+    cashflow: statementTable(symbol, "cashflow"),
+  };
+}
+
+
+
+const CF_ORDER = ["operating", "investing", "financing", "summary", "analysis"];
+
+export type CashFlowDetail = {
+  years: string[];
+  rows: { section: string; label: string; is_total: boolean; values: (number | null)[] }[];
+};
+
+// unify wording differences between years for the three totals
+function cfKey(section: string, label: string) {
+  const l = label.toLowerCase();
+  const m = l.match(/^net cash(?!.*before).*\b(operating|investing|financing)\b/);
+  return m ? `total|${m[1]}` : `${section}|${l.replace(/[^a-z0-9]+/g, " ").trim()}`;
+}
+
+export function cashFlowDetail(symbol: string, maxYears = 10): CashFlowDetail {
+  let lines: { period_end: string; section: string; label: string; is_total: number; value: number }[];
+  try {
+    lines = db.prepare(
+      `SELECT period_end, section, label, is_total, value FROM cashflow_lines
+       WHERE symbol=? ORDER BY period_end, seq`
+    ).all(symbol) as any[];
+  } catch {
+    return { years: [], rows: [] };
+  }
+
+  const years = Array.from(new Set(lines.map((l) => l.period_end))).sort().slice(-maxYears);
+
+  // per year: key (with occurrence number) -> value
+  const perYear = new Map<string, { key: string; l: (typeof lines)[number] }[]>();
+  for (const y of years) {
+    const seen = new Map<string, number>();
+    perYear.set(
+      y,
+      lines.filter((l) => l.period_end === y).map((l) => {
+        const base = cfKey(l.section, l.label);
+        const n = (seen.get(base) ?? 0) + 1;
+        seen.set(base, n);
+        return { key: `${base}#${n}`, l };
+      })
+    );
+  }
+
+  // master row order: newest year first, older years slot their extra lines in after the previous line
+  const master: { key: string; section: string; label: string; is_total: boolean }[] = [];
+  for (const y of [...years].reverse()) {
+    let prev = -1;
+    for (const { key, l } of perYear.get(y)!) {
+      let idx = master.findIndex((m) => m.key === key);
+      if (idx < 0) {
+        idx = prev >= 0 ? prev + 1 : master.findIndex((m) => m.section === l.section);
+        if (idx < 0) idx = master.length;
+        master.splice(idx, 0, { key, section: l.section, label: l.label, is_total: !!l.is_total });
+      }
+      prev = idx;
+    }
+  }
+  master.sort((a, b) => CF_ORDER.indexOf(a.section) - CF_ORDER.indexOf(b.section)); // stable
+
+  const rows = master.map((m) => ({
+    section: m.section,
+    label: m.label,
+    is_total: m.is_total,
+    values: years.map((y) => perYear.get(y)!.find((x) => x.key === m.key)?.l.value ?? null),
+  }));
+  return { years, rows };
+}

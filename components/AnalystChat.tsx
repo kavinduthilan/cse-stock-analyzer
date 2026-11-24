@@ -6,10 +6,21 @@ export default function AnalystChat({ symbol }: { symbol: string }) {
   const [a, setA] = useState(""); const [busy, setBusy] = useState(false);
 
   async function ask() {
-    setBusy(true); setA("");
-    const r = await fetch("/api/cse/analyze", { method: "POST", body: JSON.stringify({ symbol, question: q }) });
-    setA((await r.json()).answer); setBusy(false);
+  setBusy(true); setA("");
+  try {
+    const r = await fetch("/api/cse/analyze", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ symbol, question: q }),
+    });
+    const text = await r.text();
+    try { setA(JSON.parse(text).answer ?? text); } catch { setA(`Server error ${r.status}: ${text.slice(0, 300)}`); }
+  } catch (e) {
+    setA("Request failed: " + String(e));
+  } finally {
+    setBusy(false);
   }
+}
   return (
     <section className="panel p-4 space-y-3">
       <h2 className="text-xl font-semibold">AI analyst</h2>

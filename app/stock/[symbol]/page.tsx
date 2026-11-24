@@ -5,18 +5,28 @@ import Reports from "@/components/Report";
 import FinancialTrends from "@/components/FinancialTrends";
 import AnalystChat from "@/components/AnalystChat";
 import RefreshData from "@/components/RefreshData";
-import { annualRatios, quarterly } from "@/lib/analytics";
+import FinancialStatements from "@/components/FinancialStatements";
+import { annualRatios, quarterly, allStatements, cashFlowDetail } from "@/lib/analytics";
 
 export const revalidate = 30;
+
+const emptyT = { years: [], rows: [] };
 
 function loadAnalytics(symbol: string) {
   try {
     return {
       annual: annualRatios(symbol),
       quarterlyProfit: quarterly(symbol, "profit_after_tax"),
+      statements: allStatements(symbol),
+      cashflowDetail: cashFlowDetail(symbol),
     };
   } catch {
-    return { annual: [], quarterlyProfit: [] };
+    return {
+      annual: [],
+      quarterlyProfit: [],
+      statements: { position: emptyT, profit: emptyT, cashflow: emptyT },
+      cashflowDetail: { years: [], rows: [] },
+    };
   }
 }
 
@@ -35,7 +45,7 @@ export default async function StockPage({ params }: { params: Promise<{ symbol: 
   const hi52 = num(pick(info, "p12HiPrice", "hiTrade")), lo52 = num(pick(info, "p12LowPrice", "lowTrade"));
   const pos = Number.isFinite(hi52) && Number.isFinite(lo52) && hi52 > lo52 ? ((price - lo52) / (hi52 - lo52)) * 100 : NaN;
 
-  const { annual, quarterlyProfit } = loadAnalytics(symbol);
+  const { annual, quarterlyProfit, statements, cashflowDetail } = loadAnalytics(symbol);
 
   const facts: [string, string][] = [
     ["Previous close", fmt(pick(info, "previousClose"))],
@@ -75,9 +85,10 @@ export default async function StockPage({ params }: { params: Promise<{ symbol: 
         {facts.map(([k, v]) => (<div key={k} className="bg-white p-3"><dt className="text-xs text-muted">{k}</dt><dd className="font-medium">{v}</dd></div>))}
       </dl>
 
-      {/* fundamentals from your own DB, with a button to rebuild them */}
       {canRefresh && <RefreshData symbol={symbol} />}
       <FinancialTrends annual={annual} quarterlyProfit={quarterlyProfit} />
+
+      <FinancialStatements {...statements} detail={cashflowDetail} />
 
       <AnalystChat symbol={symbol} />
 

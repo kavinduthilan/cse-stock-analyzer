@@ -23,6 +23,13 @@ db.execute("""CREATE TABLE IF NOT EXISTS financials (
   PRIMARY KEY (symbol, period_end, period_months, metric))""")
 db.execute("DELETE FROM financials WHERE symbol=?", (SYMBOL,))   # safe to re-run
 
+db.execute("""CREATE TABLE IF NOT EXISTS cashflow_lines (
+  symbol TEXT NOT NULL, period_end TEXT NOT NULL, seq INTEGER NOT NULL,
+  section TEXT NOT NULL, label TEXT NOT NULL, is_total INTEGER NOT NULL,
+  value REAL NOT NULL, source_id INTEGER NOT NULL, page INTEGER,
+  PRIMARY KEY (symbol, period_end, seq))""")
+db.execute("DELETE FROM cashflow_lines WHERE symbol=?", (SYMBOL,))
+
 BALANCE = {
     "total_assets":      r"^total assets",
     "total_liabilities": r"^total liabilities(?!\s*(&|and))",
@@ -96,7 +103,7 @@ def unit_of(text):
 def detect_order(text):
     """Which entity comes first in the column header?"""
     head = "\n".join(text.splitlines()[:20])
-    g = re.search(r"\bgroup\b", head, re.I)
+    g = re.search(r"\b(group|consolidated)\b", head, re.I)
     c = re.search(r"\bcompany\b", head, re.I)
     if g and c:
         return "company_first" if c.start() < g.start() else "group_first"
@@ -213,6 +220,147 @@ def pdf_path(sid):
     p = ROOT / "pdfs_ocr" / f"{sid}.pdf"
     return p if p.exists() else ROOT / "pdfs" / f"{sid}.pdf"
 
+# ---------- full cash flow statement ----------
+CF_PAGE = re.compile(
+    r"cash flows? (from|used in|generated from)|net cash.*(operating|investing|financing)"
+    r"|^\s*(operating|investing|financing) activities", re.I | re.M)
+NUMTOK = re.compile(r"^\(?-?\d[\d,]*(?:\.\d+)?\)?$")
+DASHES = {"-", "–", "—"}
+YEAR_TOK = re.compile(r"^(?:19|20)\d\d$")
+NOTE_TAIL = re.compile(r"(?:\s+\d+(?:[./]\d+)*(?:\s*\([ivx]+\))?)+\s*$", re.I)
+TOTAL_LABEL = re.compile(
+    r"^(net cash|net increase|net decrease|net \(decrease|net \(increase|cash and cash equivalents at the end"
+    r"|cash generated from operations|operating profit before working)", re.I)
+
+
+def is_num(tok):
+    return tok in DASHES or bool(NUMTOK.match(tok))
+
+
+def cf_val(tok):
+    return 0.0 if tok in DASHES else parse(tok)
+
+
+def cf_columns(lines):
+    """Number of value columns: count the years in the header, else the most common row width."""
+    head = " ".join(l for l in lines[:12] if re.search(r"ended|note|\(rs", l, re.I))
+    years = re.findall(r"\b(?:19|20)\d{2}\b", head)
+    if len(years) in (2, 4):
+        return len(years)
+    counts = []
+    for l in lines:
+        t = [x for x in l.split() if "," in x and NUMTOK.match(x)]
+        if len(t) >= 2:
+            counts.append(len(t))
+    return max(set(counts), key=counts.count) if counts else 0
+
+
+def cf_section(text):
+    t = text.lower()
+    if t.startswith("analysis of cash"):
+        return "analysis"
+    if "net cash" in t:
+        return None
+    for key, word in (("operating", "operating activities"),
+                      ("investing", "investing activities"),
+                      ("financing", "financing activities")):
+        if word in t:
+            return key
+    return None
+
+
+def parse_cf_lines(lines, ncols):
+    rows, pending, section = [], "", "operating"
+    for raw in lines:
+        line = re.sub(r"\(\s+", "(", raw.strip())
+        if not line:
+            continue
+        parts = line.split()
+        n_numeric = sum(is_num(p) for p in parts)
+        toks = []
+        while parts and len(toks) < ncols and is_num(parts[-1]):
+            toks.insert(0, parts.pop())            # last N values; notes stay in the label part
+
+        if len(toks) < ncols or n_numeric > ncols + 3:     # heading, wrapped label, or a number dump
+            sec = cf_section(line)
+            if sec:
+                section = sec
+            if len(toks) < ncols:
+                pending = (pending + " " + line) if (pending and line[:1].islower()) else line
+            continue
+        if all(YEAR_TOK.match(t) for t in toks):           # "2026 2025 2026 2025" header row
+            pending = ""
+            continue
+
+        label = NOTE_TAIL.sub("", " ".join(parts)).strip()
+        if not label:
+            label = pending or "Subtotal"                   # label wrapped on the lines above
+        elif pending and label[:1].islower():
+            label = f"{pending} {label}"
+        pending = ""
+
+        low = label.lower()
+        kind = None
+        if low.startswith("net cash") and "before" not in low:
+            for k, w in (("cfo", "operating"), ("cfi", "investing"), ("cff", "financing")):
+                if w in low:
+                    kind = k
+        if low.startswith(("net increase", "net decrease", "net (decrease", "net (increase")) and section != "analysis":
+            section = "summary"
+        rows.append({
+            "label": label, "section": section, "nums": [cf_val(t) for t in toks], "kind": kind,
+            "total": bool(kind) or bool(TOTAL_LABEL.match(low)) or label == "Subtotal",
+        })
+        if kind == "cff":
+            section = "summary"
+    return rows
+
+
+def real(rows):
+    return sum(r["label"] != "Subtotal" for r in rows)
+
+
+def extract_cashflow(path, sid):
+    """First cash flow statement in the file -> (rows, unit, column order)."""
+    rows, unit, order_seen, run_order, pages = [], 1, "single", None, 0
+    with pdfplumber.open(path) as pdf:
+        for n, page in enumerate(pdf.pages, 1):
+            text = page.extract_text() or ""
+            o = detect_order(text)
+            if o != "single":
+                order_seen = o
+            if not CF_PAGE.search(text):
+                if rows:
+                    break                    # the statement has ended
+                continue
+            best, best_order = [], o
+            for lines in (text.splitlines(), lines_from_words(page)):
+                ncols = cf_columns(lines)
+                got = parse_cf_lines(lines, ncols) if ncols else []
+                if real(got) > real(best):
+                    oo = detect_order("\n".join(lines))
+                    best, best_order = got, (oo if oo != "single" else o)
+                if real(best) >= 6:
+                    break
+            if real(best) < 4:
+                if rows:
+                    break
+                continue
+            if unit == 1:
+                unit = unit_of(text)
+            if run_order is None and best_order != "single":
+                run_order = best_order
+            for r in best:
+                r["page"] = n
+            rows += best
+            pages += 1
+            if pages >= 3:
+                break
+    order = run_order or order_seen
+    for r in rows:
+        r["value"] = col(r["nums"], order, sid)
+    return rows, unit, order
+
 
 data = json.load(open(ROOT / f"{SYMBOL}.reports.json"))
 
@@ -229,8 +377,33 @@ for item, audited in rows:
         continue
     long_doc = bool(audited) and is_ar(item) and not is_afs(item)
     end, months = period(item["manualDate"])
+    cf_ok = False
+    if audited:                               # annual sources only
+        cf, cf_unit, cf_order = extract_cashflow(pdf, sid)
+        if cf:
+            cf_ok = True
+            db.execute("DELETE FROM cashflow_lines WHERE symbol=? AND period_end=?", (SYMBOL, end))
+            for seq, r in enumerate(cf):
+                v = r["value"] * cf_unit
+                db.execute("INSERT INTO cashflow_lines VALUES (?,?,?,?,?,?,?,?,?)",
+                           (SYMBOL, end, seq, r["section"], r["label"], int(r["total"]), v, sid, r["page"]))
+                if r["kind"]:
+                    db.execute("INSERT OR REPLACE INTO financials VALUES (?,?,?,?,?,?,?,?)",
+                               (SYMBOL, end, 12, r["kind"], v, audited, sid, r["page"]))
+            print(f"{sid} {end} cash flow: {len(cf)} lines, order={cf_order}, columns={len(cf[0]['nums'])}")
+            if cf_order == "single" and len(cf[0]["nums"]) >= 4:
+                print("   WARNING: Group/Company header not found, check FORCE_COL for", sid)
+            tot = {r["kind"]: r["value"] for r in cf if r["kind"]}
+            net = next((r["value"] for r in cf if r["label"].lower().startswith("net increase")), None)
+            if net is not None and len(tot) == 3 and abs(sum(tot.values()) - net) > max(1, abs(net) * 0.001):
+                print("   CHECK: operating + investing + financing != net change", sum(tot.values()), net)
+        else:
+            print(f"{sid} {end} NO CASH FLOW FOUND")
     cands, unit = extract(pdf, long_doc=long_doc)
     found = pick(cands)
+    if cf_ok:
+        for k in ("cfo", "cfi", "cff"):
+            found.pop(k, None)
 
     # equity = assets - liabilities when there is no explicit equity line
     if "total_equity" not in found and "total_assets" in found and "total_liabilities" in found:
